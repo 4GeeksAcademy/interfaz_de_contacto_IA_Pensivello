@@ -1,15 +1,14 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Activity,
+  ArrowDown,
   ArrowUp,
   BarChart3,
   ChevronDown,
-  Clock3,
   Copy,
   FileText,
-  Gauge,
   Hash,
   Menu,
   MessageSquare,
@@ -19,8 +18,8 @@ import {
   Search,
   Settings2,
   Sparkles,
+  Trash2,
   User,
-  Zap,
 } from 'lucide-react'
 
 const conversations = [
@@ -30,34 +29,43 @@ const conversations = [
   { title: 'Ideas para el dashboard', time: '12 sep' },
 ]
 
-const messages = [
-  {
-    role: 'user',
-    content: '¿Cómo puedo optimizar la cola de trabajos para procesar picos de tráfico sin aumentar demasiado los costes?',
-    time: '10:42:18',
-    tokens: '24 tokens',
-  },
-  {
-    role: 'assistant',
-    content:
-      'Te propongo un enfoque en tres capas: limitar la concurrencia por worker, priorizar los trabajos según su SLA y añadir backoff exponencial cuando la cola supere el umbral. Así absorbes los picos manteniendo estable el consumo.',
-    time: '10:42:20',
-    tokens: '82 tokens',
-  },
-  {
-    role: 'user',
-    content: '¿Qué valores iniciales usarías para la concurrencia y el backoff?',
-    time: '10:42:41',
-    tokens: '15 tokens',
-  },
-  {
-    role: 'assistant',
-    content:
-      'Empieza con 8 trabajos concurrentes por worker y un backoff de 250 ms con factor 2, limitado a 8 s. Mide la latencia p95 y ajusta la concurrencia en pasos de 2. Si la cola crece durante más de 60 s, activa un worker temporal.',
-    time: '10:42:43',
-    tokens: '105 tokens',
-  },
-]
+type ChatMessage = {
+  role: 'user' | 'assistant'
+  content: string
+  time: string
+  tokens: string
+  usage?: TokenUsage
+}
+
+type TokenUsage = {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+}
+
+const chatHistoryKey = 'arc-chat-history'
+
+function isTokenUsage(value: unknown): value is TokenUsage {
+  if (typeof value !== 'object' || value === null) return false
+  const usage = value as Record<string, unknown>
+  return typeof usage.promptTokens === 'number' &&
+    typeof usage.completionTokens === 'number' &&
+    typeof usage.totalTokens === 'number'
+}
+
+function isChatMessage(value: unknown): value is ChatMessage {
+  if (typeof value !== 'object' || value === null) return false
+  const item = value as Record<string, unknown>
+  return (item.role === 'user' || item.role === 'assistant') &&
+    typeof item.content === 'string' &&
+    typeof item.time === 'string' &&
+    typeof item.tokens === 'string' &&
+    (item.usage === undefined || isTokenUsage(item.usage))
+}
+
+function formatTokens(value: number) {
+  return new Intl.NumberFormat('es-ES').format(value)
+}
 
 function Metric({ icon: Icon, label, value, accent = false }: { icon: typeof Hash; label: string; value: string; accent?: boolean }) {
   return (
@@ -72,16 +80,117 @@ function Metric({ icon: Icon, label, value, accent = false }: { icon: typeof Has
 }
 
 export default function Page() {
+  const messageScrollerRef = useRef<HTMLDivElement>(null)
   const [message, setMessage] = useState('')
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [historyLoaded, setHistoryLoaded] = useState(false)
   const [rightPanel, setRightPanel] = useState(true)
   const [mobileNav, setMobileNav] = useState(false)
-  const [sent, setSent] = useState(false)
+  const [isSending, setIsSending] = useState(false)
+  const [error, setError] = useState('')
 
-  function sendMessage() {
-    if (!message.trim()) return
-    setSent(true)
+  const usageTotals = chatMessages.reduce((totals, item) => ({
+    promptTokens: totals.promptTokens + (item.usage?.promptTokens ?? 0),
+    completionTokens: totals.completionTokens + (item.usage?.completionTokens ?? 0),
+    totalTokens: totals.totalTokens + (item.usage?.totalTokens ?? 0),
+  }), { promptTokens: 0, completionTokens: 0, totalTokens: 0 })
+  const usageMessages = chatMessages.filter((item) => item.role === 'assistant' && item.usage)
+  const recentUsage = usageMessages.slice(-4)
+  const latestUsage = usageMessages[usageMessages.length - 1]?.usage
+  const maxCompletionTokens = Math.max(1, ...recentUsage.map((item) => item.usage?.completionTokens ?? 0))
+  const promptShare = usageTotals.totalTokens
+    ? Math.round((usageTotals.promptTokens / usageTotals.totalTokens) * 100)
+    : 0
+  const completionShare = usageTotals.totalTokens ? 100 - promptShare : 0
+
+  useEffect(() => {
+    try {
+      const savedHistory = localStorage.getItem(chatHistoryKey)
+      if (savedHistory) {
+        const parsedHistory: unknown = JSON.parse(savedHistory)
+        if (Array.isArray(parsedHistory)) {
+          setChatMessages(parsedHistory.filter(isChatMessage))
+        }
+      }
+    } catch {
+      localStorage.removeItem(chatHistoryKey)
+    }
+    setHistoryLoaded(true)
+  }, [])
+
+  useEffect(() => {
+    if (historyLoaded) {
+      if (chatMessages.length === 0) {
+        localStorage.removeItem(chatHistoryKey)
+      } else {
+        localStorage.setItem(chatHistoryKey, JSON.stringify(chatMessages))
+      }
+    }
+  }, [chatMessages, historyLoaded])
+
+  useEffect(() => {
+    const scroller = messageScrollerRef.current
+    scroller?.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' })
+  }, [chatMessages, isSending])
+
+  function clearConversation() {
+    localStorage.removeItem(chatHistoryKey)
+    setChatMessages([])
+    setError('')
+  }
+
+  async function sendMessage() {
+    const content = message.trim()
+    if (!content || isSending) return
+
+    const time = new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })
+    const userMessage: ChatMessage = { role: 'user', content, time, tokens: 'enviado' }
+    const conversation = [...chatMessages, userMessage]
+    setChatMessages(conversation)
     setMessage('')
-    window.setTimeout(() => setSent(false), 1800)
+    setError('')
+    setIsSending(true)
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: conversation.map(({ role, content: messageContent }) => ({ role, content: messageContent })),
+        }),
+      })
+      const result = await response.json().catch(() => null) as {
+        error?: unknown
+        reply?: unknown
+        usage?: unknown
+      } | null
+
+      if (!response.ok) {
+        const details = typeof result?.error === 'string' ? result.error : 'La API no proporcionó detalles del error.'
+        throw new Error(`Error HTTP ${response.status}: ${details}`)
+      }
+
+      const reply = result?.reply
+      if (typeof reply !== 'string' || !reply.trim()) {
+        throw new Error('La API respondió sin un mensaje válido.')
+      }
+
+      const usageValue = result?.usage
+      const usage = isTokenUsage(usageValue) ? usageValue : undefined
+      setChatMessages((current) => [...current, {
+        role: 'assistant',
+        content: reply.trim(),
+        time: new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }),
+        tokens: usage ? `${formatTokens(usage.completionTokens)} tokens de salida` : 'uso no disponible',
+        usage,
+      }])
+    } catch (requestError) {
+      setError(requestError instanceof TypeError
+        ? 'No se pudo conectar con la API. Comprueba tu conexión e inténtalo de nuevo.'
+        : requestError instanceof Error ? requestError.message : 'No se pudo enviar el mensaje.')
+    } finally {
+      setIsSending(false)
+    }
   }
 
   return (
@@ -93,12 +202,12 @@ export default function Page() {
           <span className="brand-name">arc<span>/</span>chat</span>
         </div>
         <div className="topbar-metrics">
-          <Metric icon={Hash} label="Tokens sesión" value="12,480" accent />
-          <Metric icon={Gauge} label="Consumo" value="$0.084" />
-          <Metric icon={Clock3} label="Última respuesta" value="1.82 s" />
-          <Metric icon={Zap} label="Tokens / segundo" value="104.2" accent />
+          <Metric icon={Hash} label="Tokens totales" value={formatTokens(usageTotals.totalTokens)} accent />
+          <Metric icon={ArrowDown} label="Tokens entrada" value={formatTokens(usageTotals.promptTokens)} />
+          <Metric icon={ArrowUp} label="Tokens salida" value={formatTokens(usageTotals.completionTokens)} />
+          <Metric icon={MessageSquare} label="Respuestas medidas" value={String(usageMessages.length)} accent />
         </div>
-        <div className="model-select"><span className="status-dot" /> <span>claude-3-7-sonnet</span><ChevronDown /></div>
+        <div className="model-select"><span className="status-dot" /> <span>openai/gpt-oss-20b</span><ChevronDown /></div>
       </header>
 
       <div className="workspace">
@@ -121,16 +230,53 @@ export default function Page() {
         </aside>
 
         <section className="chat-panel">
-          <div className="chat-header"><div><p className="eyebrow">Sesión activa · 04 mensajes</p><h2>Optimizar cola de trabajos</h2></div><div className="chat-actions"><button className="icon-button" aria-label="Copiar conversación"><Copy /></button><button className="icon-button" aria-label="Más opciones"><MoreHorizontal /></button><button className={`icon-button ${rightPanel ? 'selected' : ''}`} aria-label="Mostrar panel de uso" onClick={() => setRightPanel(!rightPanel)}><PanelRight /></button></div></div>
-          <div className="message-scroller">
-            <div className="date-marker"><span>Hoy, 10:42</span></div>
-            {messages.map((item, index) => <article className={`message-row ${item.role}`} key={`${item.time}-${index}`}><div className={`message-avatar ${item.role}`} aria-hidden="true">{item.role === 'assistant' ? <Sparkles /> : <User />}</div><div className="message-content"><div className="message-meta"><strong>{item.role === 'assistant' ? 'arc' : 'Tú'}</strong><span>{item.time} · {item.tokens}</span></div><p>{item.content}</p>{item.role === 'assistant' && <div className="message-tools"><button><Copy /> Copiar</button><button><Activity /> Analizar</button></div>}</div></article>)}
-            {sent && <article className="message-row assistant"><div className="message-avatar assistant"><Sparkles /></div><div className="message-content"><div className="message-meta"><strong>arc</strong><span>Ahora · generando</span></div><p className="typing"><i /><i /><i /></p></div></article>}
+          <div className="chat-header"><div><p className="eyebrow">Sesión activa · {chatMessages.length} {chatMessages.length === 1 ? 'mensaje' : 'mensajes'}</p><h2>Optimizar cola de trabajos</h2></div><div className="chat-actions"><button className="icon-button" aria-label="Copiar conversación"><Copy /></button><button className="icon-button" aria-label="Borrar conversación" title="Borrar conversación" onClick={clearConversation} disabled={isSending}><Trash2 /></button><button className="icon-button" aria-label="Más opciones"><MoreHorizontal /></button><button className={`icon-button ${rightPanel ? 'selected' : ''}`} aria-label="Mostrar panel de uso" onClick={() => setRightPanel(!rightPanel)}><PanelRight /></button></div></div>
+          <div className="message-scroller" ref={messageScrollerRef}>
+            <div className="date-marker"><span>Historial de la conversación</span></div>
+            {chatMessages.map((item, index) => <article className={`message-row ${item.role}`} key={`${item.time}-${index}`}><div className={`message-avatar ${item.role}`} aria-hidden="true">{item.role === 'assistant' ? <Sparkles /> : <User />}</div><div className="message-content"><div className="message-meta"><strong>{item.role === 'assistant' ? 'arc' : 'Tú'}</strong><span>{item.time} · {item.tokens}</span></div><p>{item.content}</p>{item.role === 'assistant' && <div className="message-tools"><button><Copy /> Copiar</button><button><Activity /> Analizar</button></div>}</div></article>)}
+            {isSending && <article className="message-row assistant"><div className="message-avatar assistant"><Sparkles /></div><div className="message-content"><div className="message-meta"><strong>arc</strong><span>Ahora · generando</span></div><p className="typing"><i /><i /><i /></p></div></article>}
           </div>
-          <div className="composer-wrap"><div className="composer"><textarea value={message} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); sendMessage() } }} placeholder="Escribe un mensaje..." rows={1} aria-label="Mensaje" /><div className="composer-footer"><span className="composer-hint">Shift + Enter para una nueva línea</span><button className="send-button" aria-label="Enviar mensaje" onClick={sendMessage}><ArrowUp /></button></div></div><p className="composer-note">arc puede cometer errores. Verifica las respuestas importantes.</p></div>
+          <div className="composer-wrap"><div className="composer"><textarea value={message} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); sendMessage() } }} placeholder="Escribe un mensaje..." rows={1} aria-label="Mensaje" /><div className="composer-footer"><span className="composer-hint">Shift + Enter para una nueva línea</span><button className="send-button" aria-label="Enviar mensaje" onClick={sendMessage} disabled={isSending || !message.trim()}><ArrowUp /></button></div></div>{error && <p className="composer-error" role="alert">{error}</p>}<p className="composer-note">arc puede cometer errores. Verifica las respuestas importantes.</p></div>
         </section>
 
-        {rightPanel && <aside className="usage-panel"><div className="usage-header"><div><p className="eyebrow">Observabilidad</p><h2>Uso de la sesión</h2></div><button className="icon-button" aria-label="Cerrar panel" onClick={() => setRightPanel(false)}>×</button></div><div className="usage-card highlight"><div className="usage-card-top"><span>Consumo total</span><BarChart3 /></div><strong>12,480 <small>tokens</small></strong><div className="progress"><span style={{ width: '62%' }} /></div><div className="usage-foot"><span>62% del límite</span><span>20k</span></div></div><div className="usage-grid"><div className="usage-card"><span>Entrada</span><strong>3,846</strong><small>tokens</small></div><div className="usage-card"><span>Salida</span><strong>8,634</strong><small>tokens</small></div></div><section className="usage-section"><div className="section-title"><span>Actividad por mensaje</span><span className="muted">tokens</span></div><div className="bars"><div className="bar-item"><span>10:42</span><i style={{ height: '25%' }} /><b>24</b></div><div className="bar-item"><span>10:42</span><i style={{ height: '64%' }} /><b>82</b></div><div className="bar-item"><span>10:42</span><i style={{ height: '18%' }} /><b>15</b></div><div className="bar-item"><span>10:42</span><i style={{ height: '82%' }} /><b>105</b></div></div></section><section className="usage-section details"><div className="section-title"><span>Detalles del modelo</span><MoreHorizontal /></div><div className="detail-row"><span>Modelo</span><strong>claude-3-7-sonnet</strong></div><div className="detail-row"><span>Ventana de contexto</span><strong>200k tokens</strong></div><div className="detail-row"><span>Temperatura</span><strong>0.7</strong></div><div className="detail-row"><span>Coste estimado</span><strong className="accent-text">$0.084</strong></div></section><div className="usage-tip"><Zap /><p><strong>Rendimiento estable</strong><br />La velocidad está un 12% por encima de tu media.</p></div></aside>}
+        {rightPanel && (
+          <aside className="usage-panel">
+            <div className="usage-header">
+              <div><p className="eyebrow">Observabilidad</p><h2>Uso de la sesión</h2></div>
+              <button className="icon-button" aria-label="Cerrar panel" onClick={() => setRightPanel(false)}>×</button>
+            </div>
+            <div className="usage-card highlight">
+              <div className="usage-card-top"><span>Tokens totales</span><BarChart3 /></div>
+              <strong>{formatTokens(usageTotals.totalTokens)} <small>tokens</small></strong>
+              <div className="progress"><span style={{ width: `${promptShare}%` }} /></div>
+              <div className="usage-foot"><span>Entrada {promptShare}%</span><span>Salida {completionShare}%</span></div>
+            </div>
+            <div className="usage-grid">
+              <div className="usage-card"><span>Entrada</span><strong>{formatTokens(usageTotals.promptTokens)}</strong><small>tokens</small></div>
+              <div className="usage-card"><span>Salida</span><strong>{formatTokens(usageTotals.completionTokens)}</strong><small>tokens</small></div>
+            </div>
+            <section className="usage-section">
+              <div className="section-title"><span>Salida por respuesta</span><span className="muted">tokens</span></div>
+              <div className="bars">
+                {recentUsage.map((item, index) => (
+                  <div className="bar-item" key={`${item.time}-${index}`}>
+                    <span>{item.time}</span>
+                    <i style={{ height: `${Math.max(5, ((item.usage?.completionTokens ?? 0) / maxCompletionTokens) * 100)}%` }} />
+                    <b>{formatTokens(item.usage?.completionTokens ?? 0)}</b>
+                  </div>
+                ))}
+              </div>
+              {recentUsage.length === 0 && <p className="usage-empty">Sin datos de uso de la API todavía.</p>}
+            </section>
+            <section className="usage-section details">
+              <div className="section-title"><span>Última respuesta</span><MoreHorizontal /></div>
+              <div className="detail-row"><span>Modelo</span><strong>openai/gpt-oss-20b</strong></div>
+              <div className="detail-row"><span>Entrada</span><strong>{latestUsage ? formatTokens(latestUsage.promptTokens) : '—'} tokens</strong></div>
+              <div className="detail-row"><span>Salida</span><strong>{latestUsage ? formatTokens(latestUsage.completionTokens) : '—'} tokens</strong></div>
+              <div className="detail-row"><span>Total</span><strong>{latestUsage ? formatTokens(latestUsage.totalTokens) : '—'} tokens</strong></div>
+            </section>
+          </aside>
+        )}
       </div>
     </main>
   )
